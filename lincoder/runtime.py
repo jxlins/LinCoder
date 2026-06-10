@@ -12,6 +12,7 @@ import uuid
 from datetime import datetime
 from pathlib import Path
 
+from .prompt_prefix import build_prompt_prefix
 from . import tools as toolkit
 
 # 默认的环境变量允许列表，Lincoder 只会将这些环境变量暴露给模型，防止泄露敏感信息
@@ -111,7 +112,7 @@ class Lincoder:
         self.last_durable_rejections = []       # 上一次模型输出中被识别为具有持久记忆意图但被拒绝保存的信息列表，这些信息是从模型输出的文本中提取出来的，并且被认为是用户希望保存到持久记忆中的重要信息，但由于某些原因（如敏感信息、格式不正确等）被 Lincoder 拒绝保存到 memory 中，Lincoder 会记录这些信息，并在后续的工具调用和模型交互中避免使用这些信息，以防止泄露敏感信息或引入错误的上下文
         self.last_durable_superseded = []       # 上一次模型输出中被识别为具有持久记忆意图但被新信息覆盖或替代的信息列表，这些信息是从模型输出的文本中提取出来的，并且被认为是用户希望保存到持久记忆中的重要信息，但由于后续的模型输出中出现了新的信息，导致这些信息被覆盖或替代，Lincoder 会记录这些信息，并在后续的工具调用和模型交互中避免使用这些信息，以防止引入过时的上下文或错误的信息
         self._last_tool_result_metadata = {}    # 上一次工具执行结果的元数据信息，包含工具执行的输入参数、输出结果、执行日志、可能的异常信息等，这些信息会在评估模型输出时使用，帮助 Lincoder 理解模型的行为和决策过程，并进行相应的工具调用和上下文更新
-        self._last_prefix_refresh = {           # 上一次前缀状态刷新的相关信息，包含刷新时的上下文状态、记忆状态、工具调用信息等，这些信息会在生成 prompt 和评估模型输出时使用，帮助 Lincoder 理解前缀状态的变化和对模型行为的影响，并进行相应的工具调用和上下文更新
+        self._last_prefix_refresh = {           # 上一次刷新 prompt 前缀时的诊断信息，包含工作区是否发生变化、提示词是否发生变化等信息，这些信息会在 refresh_prefix() 方法中更新，并在后续的工具调用和模型交互中使用，帮助 Lincoder 理解上下文变化对提示词的影响，并进行相应的工具调用和上下文更新
             "workspace_changed": False,
             "prefix_changed": False,
         }
@@ -200,8 +201,92 @@ class Lincoder:
             if name in allowd
         }
 
+    def build_prefix(self):
+        return build_prompt_prefix(workspace=self.workspace, tools=self.tools)
+
+    def _apply_prefix_state(self, prefix_state):
+        self.prefix_state = prefix_state
+        self.prefix = prefix_state.text
+
+    def refresh_prefix(self, force=False):
+        """
+        系统提示词（System Prefix）增量刷新机制。
+        在 AI Agent 运行过程中，智能地判断底层环境（工作区）是否发生了变化，从而决定是否需要重新构建并注入系统提示词。
+        """
+
+        # 1. 提取上一次生成的提示词哈希值 和 工作区指纹
+        previous_hash = getattr(getattr(self, "prefix_state", None), "hash", None)
+        previous_workspace_fingerprint = getattr(getattr(self, "prefix_state", None), "workspace_fingerprint", None)
+
+        # 工作区事实相对稳定，所以这里按整体刷新；
+        # 只有这些事实真的变化了，才重建完整 prefix。
+        # 2. 重新构建工作区上下文并计算其最新的指纹
+        refreshed_workspace = WorkspaceContext.build(self.root)
+        refreshed_workspace_fingerprint = refreshed_workspace.fingerprint()
+        # 如果当前指纹与历史指纹不同，或者传入了强制刷新参数（force=True），则判定工作区已变更，并更新内存中的工作区对象。
+        workspace_changed = force or refreshed_workspace_fingerprint != previous_workspace_fingerprint
+        if workspace_changed:
+            self.workspace = refreshed_workspace
+
+        # 3. 按需重建提示词：
+        #   只有当工作区发生变化、强制刷新、或这是首次初始化时，才真正调用 build_prefix() 构建新的提示词状态；否则，直接复用旧的 self.prefix_state。
+        prefix_state = self.build_prefix() if workspace_changed or force or previous_hash is None else self.prefix_state
+        prefix_changed = force or previous_hash != prefix_state.hash
+        if prefix_changed:
+            self._apply_prefix_state(prefix_state)
+
+        # 4. 记录并返回刷新诊断信息
+        self._last_prefix_refresh = {
+            "workspace_changed": workspace_changed,
+            "prefix_changed": prefix_changed,
+        }
+        return dict(self._last_prefix_refresh)
+
     def feature_enabled(self, name):
         return bool(self.feature_flags.get(str(name), False))
+
+    def _build_prompt_and_metadata(self, user_message):
+        """
+        Prompt 组装与全链路可观测性（Observability）机制。
+        在每一轮对话开始前，不仅负责将各个上下文模块拼装成最终的 Prompt，还极其详尽地记录了“这轮 Prompt 是如何被构建出来的”以及“当前的系统状态”。
+        """
+
+        # 1. 触发状态刷新与恢复评估
+        refresh = self.refresh_prefix()
+        # 调用 evaluate_resume_state() 评估当前是否处于断点续传（Resume）状态
+        self.resume_state = self.evaluate_resume_state()
+
+        # 2. 核心 Prompt 构建
+        prompt, metadata = self.context_manager.build(user_message)
+
+        # 3. 注入“组装过程”的量化指标（Token 成本分析）
+        # 这里把“这轮 prompt 是怎么拼出来的”连同缓存相关状态一起记下来，
+        # 后面 trace/report 才能解释清楚：为什么这一轮 prefix 变了、缓存有没有命中。
+        metadata.update(
+            {
+                "prefix_chars": len(self.prefix),
+                "workspace_chars": len(self.workspace.text()),
+                "memory_chars": len(self.memory_text()),
+                "history_chars": len(self.history_text()),
+                "request_chars": len(user_message),
+                "tool_count": len(self.tools),
+                "workspace_docs": len(self.workspace.project_docs),
+                "recent_commits": len(self.workspace.recent_commits),
+                "prefix_hash": self.prefix_state.hash,
+                "prompt_cache_key": self.prefix_state.hash,
+                "workspace_fingerprint": self.prefix_state.workspace_fingerprint,
+                "tool_signature": self.prefix_state.tool_signature,
+                "workspace_changed": refresh["workspace_changed"],
+                "prefix_changed": refresh["prefix_changed"],
+                "prompt_cache_supported": bool(getattr(self.model_client, "supports_prompt_cache", False)),
+                "resume_status": self.resume_state.get("status", CHECKPOINT_NONE_STATUS),
+                "stale_summary_invalidations": int(self.resume_state.get("stale_summary_invalidations", 0)),
+                "stale_paths": list(self.resume_state.get("stale_paths", [])),
+                "runtime_identity_mismatch_fields": list(self.resume_state.get("runtime_identity_mismatch_fields", [])),
+            }
+        )
+        metadata.update(self.detected_secret_env_summary())
+        return prompt, metadata
 
     def capture_workspace_snapshot(self):
         """

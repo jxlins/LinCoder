@@ -1,0 +1,116 @@
+"""稳定的 prompt 前缀"""
+
+import hashlib
+import json
+import textwrap
+from dataclasses import dataclass
+
+@dataclass
+class PromptPrefix:
+    """
+    prompt 前缀对象
+        text：真正发给模型的前缀文本
+        hash：前缀文本的哈希值
+        workspace_fingerprint：工作区指纹
+        tool_signature：工具签名
+        built_at：构建时间
+    """
+    text: str
+    hash: str
+    workspace_fingerprint: str
+    tool_signature: str
+    built_at: str
+
+def tool_signature(tools):
+    """
+    计算工具签名
+    只要工具的名称、描述、是否危险、输入输出 schema 有任何变化，工具签名就会改变。
+    """
+
+    payload = []
+    for name in sorted(tools):
+        tool = tools[name]
+        payload.append(
+            {
+                "name": name,
+                "schema": tool["schema"],
+                "risky": tool["risky"],
+                "description": tool["description"],
+            }
+        )
+    return hashlib.sha256(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()
+
+
+def build_prompt_prefix(workspace, tools, built_at=None):
+    """
+    构造完整前缀
+
+    :param workspace: 当前工作区上下文
+    :param tools: 当前可用工具表
+    :param built_at:
+    :return:
+    """
+
+    # 1. 生成工具说明文本
+    # 类似：- read_file(path: str, start: int, end: int) [safe] Read a file from the workspace
+    tool_lines = []
+    for name, tool in tools.items():
+        fields = ", ".join(f"{key}: {value}" for key, value in tool["schema"].items())
+        risk = "approval required" if tool["risky"] else "safe"
+        tool_lines.append(f"- {name}({fields}) [{risk}] {tool['description']}")
+    tool_text = "\n".join(tool_lines)
+
+    # 2. 构造工具调用示例
+    examples = "\n".join(
+        [
+            '<tool>{"name":"list_files","args":{"path":"."}}</tool>',
+            '<tool>{"name":"read_file","args":{"path":"README.md","start":1,"end":80}}</tool>',
+            '<tool name="write_file" path="binary_search.py"><content>def binary_search(nums, target):\n    return -1\n</content></tool>',
+            '<tool name="patch_file" path="binary_search.py"><old_text>return -1</old_text><new_text>return mid</new_text></tool>',
+            '<tool>{"name":"run_shell","args":{"command":"uv run --with pytest python -m pytest -q","timeout":20}}</tool>',
+            "<final>Done.</final>",
+        ]
+    )
+
+    # prefix 可以理解成 agent 的“工作手册”：
+    # 它是谁、工具怎么调用、当前仓库是什么状态，都写在这里。
+    text = textwrap.dedent(
+        f"""\
+                You are LinCoder, a small local coding agent working inside a local repository.
+
+                Rules:
+                - Use tools instead of guessing about the workspace.
+                - Return exactly one <tool>...</tool> or one <final>...</final>.
+                - Tool calls must look like:
+                  <tool>{{"name":"tool_name","args":{{...}}}}</tool>
+                - For write_file and patch_file with multi-line text, prefer XML style:
+                  <tool name="write_file" path="file.py"><content>...</content></tool>
+                - Final answers must look like:
+                  <final>your answer</final>
+                - Never invent tool results.
+                - Keep answers concise and concrete.
+                - If the user asks you to create or update a specific file and the path is clear, use write_file or patch_file instead of repeatedly listing files.
+                - Before writing tests for existing code, read the implementation first.
+                - When writing tests, match the current implementation unless the user explicitly asked you to change the code.
+                - New files should be complete and runnable, including obvious imports.
+                - Do not repeat the same tool call with the same arguments if it did not help. Choose a different tool or return a final answer.
+                - Required tool arguments must not be empty. Do not call read_file, write_file, patch_file, run_shell, or delegate with args={{}}.
+
+                Tools:
+                {tool_text}
+
+                Valid response examples:
+                {examples}
+
+                {workspace.text()}
+                """
+    ).strip()
+    signature = tool_signature(tools)
+
+    return PromptPrefix(
+        text=text,
+        hash=hashlib.sha256(text.encode("utf-8")).hexdigest(),  # 对完整前缀文本做 SHA256。如果 prompt 前缀任何文字变化，hash 都会变化。
+        workspace_fingerprint=workspace.fingerprint(),
+        tool_signature=signature,
+        built_at=built_at or now(),
+    )

@@ -7,6 +7,7 @@ class AgentLoop:
         self.agent = agent
 
     def run(self, user_message):
+
         agent = self.agent
         run_started_at = time.monotonic()   # 获取单调时钟（Monotonic Clock）值的函数。返回值是一个以小数秒为单位的浮点数
 
@@ -77,7 +78,6 @@ class AgentLoop:
               2. workspace_mismatch：表示工作区身份不一致
               3. context_reduction：表示 prompt 构造时发生了上下文压缩或裁剪。
             """
-
             if prompt_metadata.get("resume_status") == CHECKPOINT_PARTIAL_STALE_STATUS:
                 checkpoint = agent.create_checkpoint(task_state, user_message, trigger="freshness_mismatch")
                 agent.run_store.wrote_task_state(task_state)
@@ -130,7 +130,7 @@ class AgentLoop:
 
             prompt_cache_key = None
             prompt_cache_retention = None
-            # 判断模型后端是否支持 prompt cache
+            # 判断模型后端是否支持 prompt cache。调模型之前，会先看当前 client 支不支持 prompt cache。
             if getattr(agent.model_client, "supports_prompt_cache", False):
                 # 只有后端明确支持时，才把稳定前缀的 hash 作为 cache key 发出去。
                 prompt_cache_key = prompt_metadata.get("prompt_cache_key")
