@@ -11,6 +11,8 @@ from datetime import datetime
 import re
 from pathlib import Path
 
+from .workspace import clip, now
+
 WORKING_FILE_LIMIT = 8      # 最多记录 8 个最近相关文件
 EPISODIC_NOTE_LIMIT = 12    # 最多记录 12 条短期过程笔记
 FILE_SUMMARY_LIMIT = 6      # 渲染给模型时最多展示 6 个文件摘要
@@ -67,7 +69,7 @@ def default_memory_state():
         "next_note_index": 0,
     }
 
-class DurableMemoryStort:
+class DurableMemoryStore:
     """
     长期记忆存储
     这个类负责把长期记忆写入磁盘
@@ -173,7 +175,7 @@ class DurableMemoryStort:
                 )
         return notes
 
-     @staticmethod
+    @staticmethod
     def _subject_key(text):
          """
          这个方法尝试从一条记忆中抽出主语。

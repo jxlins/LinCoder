@@ -1,5 +1,10 @@
+"""Agent control loop extracted from the runtime facade."""
+
 import time
+
+from .checkpoint import CHECKPOINT_NONE_STATUS, CHECKPOINT_PARTIAL_STALE_STATUS, CHECKPOINT_WORKSPACE_MISMATCH_STATUS
 from .task_state import TaskState
+from .workspace import clip, now
 
 
 class AgentLoop:
@@ -13,6 +18,7 @@ class AgentLoop:
 
         # 1. 把用户请求写入 memory 的 task_summary，用于后续 prompt 构造，让模型始终知道当前任务目标。
         agent.memory.set_task_summary(user_message)
+
         # 2. 把用户消息写入历史记录 session history
         agent.record({
             "role": "user", "content": user_message, "created_at": now()
@@ -27,6 +33,7 @@ class AgentLoop:
         # 支持 任务恢复机制 可以根据 resume_status 判断是否继续执行，是否存在状态过期，是否存在工作区不一致。
         task_state.resume_status = agent.resume_state.get("status", CHECKPOINT_NONE_STATUS)
         agent.current_task_status = task_state
+
         # 4. 在 .lincoder/runs/<run_id>/ 下创建本轮 run 目录
         # 5. 立刻写出第一版 task_state.json
         agent.current_run_dir = agent.run_store.start_run(task_state)
@@ -80,7 +87,7 @@ class AgentLoop:
             """
             if prompt_metadata.get("resume_status") == CHECKPOINT_PARTIAL_STALE_STATUS:
                 checkpoint = agent.create_checkpoint(task_state, user_message, trigger="freshness_mismatch")
-                agent.run_store.wrote_task_state(task_state)
+                agent.run_store.write_task_state(task_state)
                 agent.emit_trace(
                     task_state,
                     "checkpoint_created",

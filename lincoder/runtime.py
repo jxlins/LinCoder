@@ -12,8 +12,19 @@ import uuid
 from datetime import datetime
 from pathlib import Path
 
-from .prompt_prefix import build_prompt_prefix
+from . import checkpoint as checkpointlib
+from . import memory as memorylib
+from . import security as securitylib
+from .context_manager import ContextManager
+from .checkpoint import CHECKPOINT_NONE_STATUS
+from .prompt_prefix import build_prompt_prefix, tool_signature
+from .run_store import RunStore
+from .security import REDACTED_VALUE
+from .session_store import SessionStore
+from .tool_context import ToolContext
+from .tool_executor import ToolExecutor
 from . import tools as toolkit
+from .workspace import IGNORED_PATH_NAMES, MAX_HISTORY, WorkspaceContext, clip, now
 
 # 默认的环境变量允许列表，Lincoder 只会将这些环境变量暴露给模型，防止泄露敏感信息
 DEFAULT_SHELL_ENV_ALLOWLIST = ("HOME", "LANG", "LC_ALL", "LC_CTYPE", "LOGNAME", "PATH", "PWD", "SHELL", "TERM", "TMPDIR", "TMP", "TEMP", "USER")
@@ -156,6 +167,14 @@ class Lincoder:
         if not isinstance(resume_state, dict):
             self.session["resume_state"] = {}
 
+    def invalidate_stale_memory(self):
+        invalidated = self.memory.invalidate_stale_file_summaries()
+        self.session["memory"] = self.memory.to_dict()
+        return invalidated
+
+    def evaluate_resume_state(self):
+        return checkpointlib.evaluate_resume_state(self)
+
     def build_tools(self):
         """
         构建工具列表，返回一个字典，键是工具名称，值是工具对象。
@@ -242,6 +261,14 @@ class Lincoder:
         }
         return dict(self._last_prefix_refresh)
 
+    def record(self, item):
+        """
+        对话历史记录器（Conversation Historian）。
+        这个函数负责将每一轮对话的关键信息（如用户输入、模型输出、工具调用等）以结构化的形式追加到会话历史中，并持久化保存到会话存储中。
+        """
+        self.session["history"].append(item)
+        self.session_path = self.session_store.save(self.session)
+
     def feature_enabled(self, name):
         return bool(self.feature_flags.get(str(name), False))
 
@@ -287,6 +314,15 @@ class Lincoder:
         )
         metadata.update(self.detected_secret_env_summary())
         return prompt, metadata
+
+    def emit_trace(self, task_state, event, payload=None):
+        """记录事件追踪数据"""
+        payload = self.redact_artifact(payload or {})
+        payload["event"] = event
+        payload["created_at"] = now()
+        # trace 是运行中的逐事件时间线，适合回答“这一轮 agent 到底做了什么”。
+        self.run_store.append_trace(task_state, payload)
+        return payload
 
     def capture_workspace_snapshot(self):
         """
@@ -340,6 +376,12 @@ class Lincoder:
             else:
                 summaries.append(f"modified:{path}")
         return changed_paths, summaries
+
+    def create_checkpoint(self, task_state, user_message, trigger):
+        return checkpointlib.create_checkpoint(self, task_state, user_message, trigger)
+
+    def infer_next_step(self, task_state):
+        return checkpointlib.infer_next_step(task_state)
 
     def update_memory_after_tool(self, name, args, result):
         """把少量高价值工具结果沉淀到 working memory。
@@ -464,6 +506,14 @@ class Lincoder:
         recent = tool_events[-2:]
         # all(...)：只有当最近两次调用的名称和参数都与当前请求完全相同时，才返回 True。
         return all(item["name"] == name and item["args"] == args for item in recent)
+
+    @staticmethod
+    def new_task_id():
+        return "task_" + datetime.now().strftime("%Y%m%d-%H%M%S") + "-" + uuid.uuid4().hex[:6]
+
+    @staticmethod
+    def new_run_id():
+        return "run_" + datetime.now().strftime("%Y%m%d-%H%M%S") + "-" + uuid.uuid4().hex[:6]
 
     def tool_example(self, name):
         """提供工具调用示例，帮助模型理解工具的正确使用方式。"""
